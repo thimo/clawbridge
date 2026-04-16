@@ -1,0 +1,24 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:clawbridge}",
+      "name": "Debug clawbridge",
+      "target": "clawbridge",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug clawbridge"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:clawbridge}",
+      "name": "Release clawbridge",
+      "target": "clawbridge",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release clawbridge"
+    }
+  ]
+}
