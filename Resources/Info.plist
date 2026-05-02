@@ -28,5 +28,11 @@
     <string>Clawbridge reads your calendar events to power scheduled automations (daily briefing, office-day detection, freeagent booking).</string>
     <key>NSCalendarsFullAccessUsageDescription</key>
     <string>Clawbridge reads your calendar events to power scheduled automations (daily briefing, office-day detection, freeagent booking).</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>Clawbridge reads and creates Reminders so scheduled automations (and Vonk via Telegram) can surface and add tasks.</string>
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>Clawbridge reads and creates Reminders so scheduled automations (and Vonk via Telegram) can surface and add tasks.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Clawbridge controls Mail.app via AppleScript to read inbox messages and send mail on behalf of automations.</string>
 </dict>
 </plist>

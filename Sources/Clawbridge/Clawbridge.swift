@@ -6,6 +6,11 @@ struct Clawbridge: AsyncParsableCommand {
         commandName: "clawbridge",
         abstract: "Local macOS bridge for scheduled automation.",
         version: "0.1.0",
-        subcommands: [CalendarCommand.self, PermissionsCommand.self]
+        subcommands: [
+            CalendarCommand.self,
+            RemindersCommand.self,
+            MailCommand.self,
+            PermissionsCommand.self,
+        ]
     )
 }

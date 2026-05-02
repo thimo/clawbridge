@@ -12,35 +12,55 @@ struct PermissionsCommand: AsyncParsableCommand {
         print("Clawbridge is requesting macOS permissions.")
         print("If a system dialog appears, click \"Allow Full Access\".")
         print("")
-        print("Requesting Calendar access...")
 
         let store = EKEventStore()
-        let granted: Bool
+        var anyFailed = false
+
+        // ---- Calendar ----
+        print("Requesting Calendar access...")
         do {
-            granted = try await store.requestFullAccessToEvents()
+            let granted = try await store.requestFullAccessToEvents()
+            if granted {
+                let cals = store.calendars(for: .event)
+                print("  ✓ Calendar: granted (\(cals.count) calendars)")
+            } else {
+                print("  ✗ Calendar: denied")
+                anyFailed = true
+            }
         } catch {
-            print("  ✗ Error while requesting access: \(error.localizedDescription)")
-            throw ExitCode.failure
+            print("  ✗ Calendar error: \(error.localizedDescription)")
+            anyFailed = true
         }
 
-        if granted {
-            print("  ✓ Calendar: granted")
-        } else {
-            print("  ✗ Calendar: denied")
+        // ---- Reminders ----
+        print("Requesting Reminders access...")
+        do {
+            let granted = try await store.requestFullAccessToReminders()
+            if granted {
+                let lists = store.calendars(for: .reminder)
+                print("  ✓ Reminders: granted (\(lists.count) lists)")
+            } else {
+                print("  ✗ Reminders: denied")
+                anyFailed = true
+            }
+        } catch {
+            print("  ✗ Reminders error: \(error.localizedDescription)")
+            anyFailed = true
+        }
+
+        // ---- Mail (AppleScript / Automation) ----
+        // We don't pre-flight Automation TCC: macOS triggers the prompt the
+        // first time we actually talk to Mail.app. Just remind the user.
+        print("Mail (AppleScript): no pre-flight check; the macOS prompt to")
+        print("  \"control Mail\" will appear the first time `clawbridge mail …`")
+        print("  is run. Make sure Mail.app is running.")
+
+        if anyFailed {
             print("")
-            print("To fix: open System Settings → Privacy & Security → Calendars,")
-            print("then enable Clawbridge in the list. If Clawbridge is not shown,")
+            print("To fix denied permissions: System Settings → Privacy & Security → ")
+            print("Calendars / Reminders, enable Clawbridge. If Clawbridge is missing,")
             print("re-run this command from a GUI-session terminal (iTerm, Terminal.app).")
             throw ExitCode.failure
-        }
-
-        // As a quick smoke test, try to fetch calendars so any additional TCC
-        // flags (fine-grained calendar access in macOS 14+) are exercised.
-        let cals = store.calendars(for: .event)
-        print("")
-        print("Detected \(cals.count) calendar(s):")
-        for cal in cals.sorted(by: { $0.title < $1.title }) {
-            print("  - \(cal.title)")
         }
     }
 }
