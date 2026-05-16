@@ -14,6 +14,8 @@ struct MailCommand: AsyncParsableCommand {
             MailRecentCommand.self,
             MailTodayCommand.self,
             MailSearchCommand.self,
+            MailFoldersCommand.self,
+            MailTrashCommand.self,
             MailSendCommand.self,
         ]
     )
@@ -24,7 +26,7 @@ struct MailCommand: AsyncParsableCommand {
 struct MailUnreadCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "unread",
-        abstract: "Print unread messages from the inbox as a JSON array."
+        abstract: "Print unread messages from a mailbox as a JSON array."
     )
 
     @Option(name: [.customShort("n"), .long], help: "Maximum number of messages to return.")
@@ -33,13 +35,16 @@ struct MailUnreadCommand: AsyncParsableCommand {
     @Option(name: [.customShort("a"), .long], help: "Filter to a specific account name (repeatable).")
     var account: [String] = []
 
+    @Option(name: [.customShort("m"), .long], help: "Mailbox/folder name (default: inbox).")
+    var mailbox: String?
+
     @Option(name: [.customShort("o"), .long], help: "Write JSON to this file instead of stdout.")
     var output: String?
 
     func run() async throws {
         do {
-            let messages = try MailScript.fetchInboxMessages(
-                unreadOnly: true, limit: limit, accounts: account, sinceDate: nil
+            let messages = try MailScript.fetchMessages(
+                unreadOnly: true, limit: limit, accounts: account, mailbox: mailbox, sinceDate: nil
             )
             try MailJSON.emit(messages, toFile: output)
         } catch {
@@ -52,7 +57,7 @@ struct MailUnreadCommand: AsyncParsableCommand {
 struct MailRecentCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "recent",
-        abstract: "Print the most recent messages from the inbox as a JSON array."
+        abstract: "Print the most recent messages from a mailbox as a JSON array."
     )
 
     @Option(name: [.customShort("n"), .long], help: "Maximum number of messages to return.")
@@ -61,13 +66,16 @@ struct MailRecentCommand: AsyncParsableCommand {
     @Option(name: [.customShort("a"), .long], help: "Filter to a specific account name (repeatable).")
     var account: [String] = []
 
+    @Option(name: [.customShort("m"), .long], help: "Mailbox/folder name (default: inbox).")
+    var mailbox: String?
+
     @Option(name: [.customShort("o"), .long], help: "Write JSON to this file instead of stdout.")
     var output: String?
 
     func run() async throws {
         do {
-            let messages = try MailScript.fetchInboxMessages(
-                unreadOnly: false, limit: limit, accounts: account, sinceDate: nil
+            let messages = try MailScript.fetchMessages(
+                unreadOnly: false, limit: limit, accounts: account, mailbox: mailbox, sinceDate: nil
             )
             try MailJSON.emit(messages, toFile: output)
         } catch {
@@ -86,14 +94,17 @@ struct MailTodayCommand: AsyncParsableCommand {
     @Option(name: [.customShort("a"), .long], help: "Filter to a specific account name (repeatable).")
     var account: [String] = []
 
+    @Option(name: [.customShort("m"), .long], help: "Mailbox/folder name (default: inbox).")
+    var mailbox: String?
+
     @Option(name: [.customShort("o"), .long], help: "Write JSON to this file instead of stdout.")
     var output: String?
 
     func run() async throws {
         do {
             let startOfDay = Calendar.current.startOfDay(for: Date())
-            let messages = try MailScript.fetchInboxMessages(
-                unreadOnly: false, limit: 200, accounts: account, sinceDate: startOfDay
+            let messages = try MailScript.fetchMessages(
+                unreadOnly: false, limit: 200, accounts: account, mailbox: mailbox, sinceDate: startOfDay
             )
             try MailJSON.emit(messages, toFile: output)
         } catch {
@@ -106,7 +117,7 @@ struct MailTodayCommand: AsyncParsableCommand {
 struct MailSearchCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "search",
-        abstract: "Search inbox messages by subject/sender substring (case-insensitive)."
+        abstract: "Search a mailbox by subject/sender substring (case-insensitive)."
     )
 
     @Option(name: [.customShort("q"), .long], help: "Substring to match in subject OR sender.")
@@ -118,13 +129,83 @@ struct MailSearchCommand: AsyncParsableCommand {
     @Option(name: [.customShort("a"), .long], help: "Filter to a specific account name (repeatable).")
     var account: [String] = []
 
+    @Option(name: [.customShort("m"), .long], help: "Mailbox/folder name (default: inbox).")
+    var mailbox: String?
+
     @Option(name: [.customShort("o"), .long], help: "Write JSON to this file instead of stdout.")
     var output: String?
 
     func run() async throws {
         do {
-            let messages = try MailScript.searchInbox(query: query, limit: limit, accounts: account)
+            let messages = try MailScript.search(
+                query: query, limit: limit, accounts: account, mailbox: mailbox
+            )
             try MailJSON.emit(messages, toFile: output)
+        } catch {
+            try MailJSON.emitError(error, toFile: output)
+            throw ExitCode.failure
+        }
+    }
+}
+
+struct MailFoldersCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "folders",
+        abstract: "List mailbox/folder names per account as a JSON array."
+    )
+
+    @Option(name: [.customShort("a"), .long], help: "Filter to a specific account name (repeatable).")
+    var account: [String] = []
+
+    @Option(name: [.customShort("o"), .long], help: "Write JSON to this file instead of stdout.")
+    var output: String?
+
+    func run() async throws {
+        do {
+            let folders = try MailScript.listFolders(accounts: account)
+            let payload: [[String: Any]] = folders.map { ["account": $0.account, "mailbox": $0.mailbox] }
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try MailJSON.write(data, toFile: output)
+        } catch {
+            try MailJSON.emitError(error, toFile: output)
+            throw ExitCode.failure
+        }
+    }
+}
+
+struct MailTrashCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "trash",
+        abstract: "Move messages (matched by message id) to Trash. Recoverable."
+    )
+
+    @Option(name: [.customLong("message-id"), .customShort("i")], help: "Message id to trash (repeatable).")
+    var messageId: [String]
+
+    @Option(name: [.customShort("a"), .long], help: "Limit to a specific account name (repeatable).")
+    var account: [String] = []
+
+    @Option(name: [.customShort("m"), .long], help: "Mailbox/folder name to search in (default: inbox).")
+    var mailbox: String?
+
+    @Option(name: [.customShort("o"), .long], help: "Write status JSON to this file instead of stdout.")
+    var output: String?
+
+    func run() async throws {
+        do {
+            guard !messageId.isEmpty else {
+                throw CLIError("At least one --message-id is required.")
+            }
+            let moved = try MailScript.trash(
+                messageIds: messageId, accounts: account, mailbox: mailbox
+            )
+            let payload: [String: Any] = [
+                "ok": true,
+                "requested": messageId.count,
+                "moved": moved,
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try MailJSON.write(data, toFile: output)
         } catch {
             try MailJSON.emitError(error, toFile: output)
             throw ExitCode.failure
@@ -203,16 +284,26 @@ struct MailSendCommand: AsyncParsableCommand {
 // MARK: - AppleScript bridge
 
 enum MailScript {
-    static func fetchInboxMessages(
+    /// Per-account AppleScript expression yielding the message source for loop var `acc`.
+    /// `inbox of acc` when no mailbox name given, else `mailbox "<name>" of acc`.
+    private static func mailboxExpr(_ mailbox: String?) -> String {
+        guard let mb = mailbox else { return "inbox of acc" }
+        let esc = mb.replacingOccurrences(of: "\"", with: "\\\"")
+        return "mailbox \"\(esc)\" of acc"
+    }
+
+    static func fetchMessages(
         unreadOnly: Bool,
         limit: Int,
         accounts: [String],
+        mailbox: String?,
         sinceDate: Date?
     ) throws -> [MailMessage] {
         let unreadFilter = unreadOnly ? "and read status is false" : ""
         let accountFilter = makeAccountFilter(accounts)
         let sinceFilter = makeSinceFilter(sinceDate)
         let filterClause = [unreadFilter, sinceFilter].filter { !$0.isEmpty }.joined(separator: " ")
+        let src = mailboxExpr(mailbox)
 
         let script = """
         tell application "Mail"
@@ -221,15 +312,15 @@ enum MailScript {
             \(accountFilter.scriptHeader)
             repeat with acc in \(accountFilter.scriptIterable)
                 try
-                    set inboxMsgs to (messages of inbox of acc whose 1 = 1 \(filterClause))
-                    set msgList to msgList & inboxMsgs
+                    set boxMsgs to (messages of (\(src)) whose 1 = 1 \(filterClause))
+                    set msgList to msgList & boxMsgs
                 end try
             end repeat
             -- Sort by date received descending; AppleScript can't sort, so we iterate.
             set total to count of msgList
             set cap to \(limit)
             if total < cap then set cap to total
-            -- Mail returns inbox messages roughly newest-first; trust that order.
+            -- Mail returns mailbox messages roughly newest-first; trust that order.
             repeat with i from 1 to cap
                 set m to item i of msgList
                 try
@@ -287,9 +378,10 @@ enum MailScript {
         return parseMessageList(raw)
     }
 
-    static func searchInbox(query: String, limit: Int, accounts: [String]) throws -> [MailMessage] {
+    static func search(query: String, limit: Int, accounts: [String], mailbox: String?) throws -> [MailMessage] {
         let q = query.replacingOccurrences(of: "\"", with: "\\\"")
         let accountFilter = makeAccountFilter(accounts)
+        let src = mailboxExpr(mailbox)
         let script = """
         tell application "Mail"
             set out to ""
@@ -297,7 +389,7 @@ enum MailScript {
             \(accountFilter.scriptHeader)
             repeat with acc in \(accountFilter.scriptIterable)
                 try
-                    set hits to (messages of inbox of acc whose (subject contains "\(q)" or sender contains "\(q)"))
+                    set hits to (messages of (\(src)) whose (subject contains "\(q)" or sender contains "\(q)"))
                     set msgList to msgList & hits
                 end try
             end repeat
@@ -358,6 +450,65 @@ enum MailScript {
         """
         let raw = try runOsascript(script)
         return parseMessageList(raw)
+    }
+
+    static func listFolders(accounts: [String]) throws -> [(account: String, mailbox: String)] {
+        let accountFilter = makeAccountFilter(accounts)
+        let script = """
+        tell application "Mail"
+            set out to ""
+            \(accountFilter.scriptHeader)
+            repeat with acc in \(accountFilter.scriptIterable)
+                try
+                    set an to name of acc
+                    repeat with mb in mailboxes of acc
+                        try
+                            set out to out & an & "\\t" & (name of mb) & "\\n"
+                        end try
+                    end repeat
+                end try
+            end repeat
+            return out
+        end tell
+        """
+        let raw = try runOsascript(script)
+        return raw.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
+            let parts = line.components(separatedBy: "\t")
+            guard parts.count >= 2 else { return nil }
+            return (account: parts[0], mailbox: parts[1])
+        }
+    }
+
+    static func trash(messageIds: [String], accounts: [String], mailbox: String?) throws -> Int {
+        let accountFilter = makeAccountFilter(accounts)
+        let src = mailboxExpr(mailbox)
+        let idLiterals = messageIds
+            .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
+            .joined(separator: ", ")
+        let script = """
+        tell application "Mail"
+            set n to 0
+            set wanted to {\(idLiterals)}
+            \(accountFilter.scriptHeader)
+            repeat with acc in \(accountFilter.scriptIterable)
+                try
+                    set mb to (\(src))
+                    repeat with wid in wanted
+                        try
+                            set hits to (messages of mb whose message id is (wid as text))
+                            repeat with m in hits
+                                delete m
+                                set n to n + 1
+                            end repeat
+                        end try
+                    end repeat
+                end try
+            end repeat
+            return (n as text)
+        end tell
+        """
+        let raw = try runOsascript(script).trimmingCharacters(in: .whitespacesAndNewlines)
+        return Int(raw) ?? 0
     }
 
     static func send(
