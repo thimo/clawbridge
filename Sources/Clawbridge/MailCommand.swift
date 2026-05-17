@@ -497,6 +497,12 @@ enum MailScript {
                         try
                             set hits to (messages of mb whose message id is (wid as text))
                             repeat with m in hits
+                                -- Mark read before trashing: a message moved
+                                -- to Trash while still unread keeps inflating
+                                -- unread counts / re-surfacing in some clients.
+                                try
+                                    set read status of m to true
+                                end try
                                 delete m
                                 set n to n + 1
                             end repeat
