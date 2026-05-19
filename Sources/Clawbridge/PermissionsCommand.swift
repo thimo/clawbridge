@@ -6,16 +6,27 @@ import Foundation
 struct PermissionsCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "permissions",
-        abstract: "Request TCC permissions interactively, or check them non-interactively with --check."
+        abstract:
+            "Request TCC permissions interactively, or check them non-interactively with --check."
     )
 
-    @Flag(name: .long, help: "Report current authorization status as JSON and exit, WITHOUT prompting. Safe for unattended preflight.")
+    @Flag(
+        name: .long,
+        help:
+            "Report current authorization status as JSON and exit, WITHOUT prompting. Safe for unattended preflight."
+    )
     var check: Bool = false
 
-    @Option(name: .long, help: "With --check: which permission to report (calendar | reminders | mail). Default: calendar.")
+    @Option(
+        name: .long,
+        help:
+            "With --check: which permission to report (calendar | reminders | mail). Default: calendar."
+    )
     var domain: String = "calendar"
 
-    @Option(name: [.customShort("o"), .long], help: "With --check: write JSON here instead of stdout (used when launched via `open -a`).")
+    @Option(
+        name: [.customShort("o"), .long],
+        help: "With --check: write JSON here instead of stdout (used when launched via `open -a`).")
     var output: String?
 
     func run() async throws {
@@ -38,11 +49,15 @@ struct PermissionsCommand: AsyncParsableCommand {
         case "mail":
             result = Self.mailAutomationStatus()
         default:
-            let payload: [String: Any] = ["error": "unknown --domain '\(domain)' (expected calendar|reminders|mail)"]
+            let payload: [String: Any] = [
+                "error": "unknown --domain '\(domain)' (expected calendar|reminders|mail)"
+            ]
             try writeJSON(payload)
             throw ExitCode.failure
         }
-        try writeJSON(["granted": result.granted, "status": result.status, "domain": domain.lowercased()])
+        try writeJSON([
+            "granted": result.granted, "status": result.status, "domain": domain.lowercased(),
+        ])
         if !result.granted { throw ExitCode.failure }
     }
 
@@ -50,13 +65,13 @@ struct PermissionsCommand: AsyncParsableCommand {
     private static func eventKitStatus(_ type: EKEntityType) -> (Bool, String) {
         let s = EKEventStore.authorizationStatus(for: type)
         switch s {
-        case .fullAccess:    return (true, "fullAccess")
-        case .authorized:    return (true, "authorized")
-        case .writeOnly:     return (false, "writeOnly")        // insufficient: we read
+        case .fullAccess: return (true, "fullAccess")
+        case .authorized: return (true, "authorized")
+        case .writeOnly: return (false, "writeOnly")  // insufficient: we read
         case .notDetermined: return (false, "notDetermined")
-        case .denied:        return (false, "denied")
-        case .restricted:    return (false, "restricted")
-        @unknown default:    return (false, "unknown")
+        case .denied: return (false, "denied")
+        case .restricted: return (false, "restricted")
+        @unknown default: return (false, "unknown")
         }
     }
 
@@ -75,13 +90,16 @@ struct PermissionsCommand: AsyncParsableCommand {
                 bundleID.utf8.count,
                 &target
             )
-            guard createErr == 0 else { status = OSStatus(createErr); return }
+            guard createErr == 0 else {
+                status = OSStatus(createErr)
+                return
+            }
             defer { AEDisposeDesc(&target) }
             status = AEDeterminePermissionToAutomateTarget(
                 &target,
                 AEEventClass(typeWildCard),
                 AEEventID(typeWildCard),
-                false // askUserIfNeeded: never prompt
+                false  // askUserIfNeeded: never prompt
             )
         }
         switch status {
@@ -90,11 +108,11 @@ struct PermissionsCommand: AsyncParsableCommand {
         case OSStatus(errAEEventNotPermitted):
             return (false, "denied")
         case OSStatus(procNotFound):
-            return (true, "mail-not-running-unknown") // don't block on this
-        case -1744: // errAEEventWouldRequireUserConsent
+            return (true, "mail-not-running-unknown")  // don't block on this
+        case -1744:  // errAEEventWouldRequireUserConsent
             return (false, "notDetermined")
         default:
-            return (true, "unknown(\(status))") // unknown → don't false-block
+            return (true, "unknown(\(status))")  // unknown → don't false-block
         }
     }
 
