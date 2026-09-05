@@ -17,6 +17,7 @@ struct MailCommand: AsyncParsableCommand {
             MailFoldersCommand.self,
             MailTrashCommand.self,
             MailSendCommand.self,
+            MailSaveCommand.self,
         ]
     )
 }
@@ -281,6 +282,67 @@ struct MailSendCommand: AsyncParsableCommand {
     }
 }
 
+struct MailSaveCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "save",
+        abstract: "Save a message's raw RFC822 source (Mail.app's `source` property) to a .eml file."
+    )
+
+    @Option(name: [.customLong("message-id"), .customShort("i")], help: "Message id to save.")
+    var messageId: String
+
+    // `--file` is the .eml destination; `--output` below stays the JSON-result
+    // path used by the `open -a` wrapper — kept as two separate options
+    // because they point at two different files.
+    @Option(name: .long, help: "Destination path for the .eml file.")
+    var file: String
+
+    @Option(name: [.customShort("a"), .long], help: "Limit to a specific account name (repeatable).")
+    var account: [String] = []
+
+    @Option(name: [.customShort("m"), .long], help: "Mailbox/folder name to search in (default: inbox).")
+    var mailbox: String?
+
+    @Flag(name: .long, help: "Overwrite --file if it already exists.")
+    var force: Bool = false
+
+    @Option(name: [.customShort("o"), .long], help: "Write status JSON to this file instead of stdout.")
+    var output: String?
+
+    func run() async throws {
+        do {
+            let fileURL = URL(fileURLWithPath: file)
+            let dirURL = fileURL.deletingLastPathComponent()
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: dirURL.path) else {
+                throw CLIError("directory does not exist: \(dirURL.path)")
+            }
+            if !force && fm.fileExists(atPath: fileURL.path) {
+                throw CLIError("file exists: \(fileURL.path)")
+            }
+
+            let result = try MailScript.save(messageId: messageId, accounts: account, mailbox: mailbox)
+            guard let data = result.source.data(using: .utf8) else {
+                throw CLIError("failed to encode message source as UTF-8")
+            }
+            try data.write(to: fileURL)
+
+            var payload: [String: Any] = [
+                "file": fileURL.path,
+                "subject": result.subject,
+                "sender": result.sender,
+                "bytes": data.count,
+            ]
+            if let r = result.receivedISO { payload["received"] = r }
+            let jsonData = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try MailJSON.write(jsonData, toFile: output)
+        } catch {
+            try MailJSON.emitError(error, toFile: output)
+            throw ExitCode.failure
+        }
+    }
+}
+
 // MARK: - AppleScript bridge
 
 enum MailScript {
@@ -517,6 +579,104 @@ enum MailScript {
         return Int(raw) ?? 0
     }
 
+    /// Fetch one message's subject/sender/received-date/raw-source by exact RFC
+    /// Message-ID. Throws if zero or more than one message matches.
+    static func save(
+        messageId: String, accounts: [String], mailbox: String?
+    ) throws -> (subject: String, sender: String, receivedISO: String?, source: String) {
+        let escId = messageId.replacingOccurrences(of: "\"", with: "\\\"")
+        let accountFilter = makeAccountFilter(accounts)
+        let src = mailboxExpr(mailbox)
+        // Generated fresh per call: a boundary the message source itself can't
+        // fake, so metadata and raw source can be split back apart in Swift
+        // without assuming anything about what's inside the source.
+        let separator = UUID().uuidString
+        let script = """
+        tell application "Mail"
+            set wanted to "\(escId)"
+            set hits to {}
+            \(accountFilter.scriptHeader)
+            repeat with acc in \(accountFilter.scriptIterable)
+                try
+                    set mb to (\(src))
+                    try
+                        set found to (messages of mb whose message id is wanted)
+                        set hits to hits & found
+                    end try
+                end try
+            end repeat
+            set n to count of hits
+            if n is not 1 then
+                return (n as text)
+            end if
+            set m to item 1 of hits
+            try
+                set sub to subject of m
+            on error
+                set sub to ""
+            end try
+            try
+                set snd to sender of m
+            on error
+                set snd to ""
+            end try
+            set rcvIso to ""
+            try
+                set rcv to date received of m
+                set rcvIso to my isoFromDate(rcv)
+            end try
+            set srcText to source of m
+            return "1" & linefeed & sub & "\\t" & snd & "\\t" & rcvIso & linefeed & "\(separator)" & linefeed & srcText
+        end tell
+
+        on isoFromDate(d)
+            set y to year of d as integer
+            set mo to (month of d as integer)
+            set dy to day of d
+            set h to hours of d
+            set mi to minutes of d
+            set s to seconds of d
+            set ystr to text -4 thru -1 of ("0000" & y)
+            set mostr to text -2 thru -1 of ("00" & mo)
+            set dystr to text -2 thru -1 of ("00" & dy)
+            set hstr to text -2 thru -1 of ("00" & h)
+            set mistr to text -2 thru -1 of ("00" & mi)
+            set sstr to text -2 thru -1 of ("00" & s)
+            return ystr & "-" & mostr & "-" & dystr & "T" & hstr & ":" & mistr & ":" & sstr
+        end isoFromDate
+        """
+
+        var raw = try runOsascript(script)
+        // osascript appends exactly one trailing newline to whatever the
+        // script returns; strip only that one so a message source that
+        // itself ends in blank lines round-trips untouched.
+        if raw.hasSuffix("\n") { raw.removeLast() }
+
+        guard let sepRange = raw.range(of: "\n\(separator)\n") else {
+            let countLine = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let count = Int(countLine) else {
+                throw CLIError("unexpected AppleScript output while saving message \(messageId)")
+            }
+            if count == 0 {
+                throw CLIError("message not found: \(messageId)")
+            }
+            throw CLIError("ambiguous: \(count) messages match \(messageId)")
+        }
+
+        let metadataBlock = String(raw[raw.startIndex..<sepRange.lowerBound])
+        let sourceText = String(raw[sepRange.upperBound...])
+        let metaLines = metadataBlock.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        guard metaLines.count == 2 else {
+            throw CLIError("unexpected AppleScript output while saving message \(messageId)")
+        }
+        let fields = metaLines[1].components(separatedBy: "\t")
+        let subject = fields.count > 0 ? fields[0] : ""
+        let sender = fields.count > 1 ? fields[1] : ""
+        let receivedISO = (fields.count > 2 && !fields[2].isEmpty) ? fields[2] : nil
+
+        return (subject: subject, sender: sender, receivedISO: receivedISO, source: sourceText)
+    }
+
     static func send(
         to: [String],
         cc: [String],
@@ -622,14 +782,39 @@ enum MailScript {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+
+        // Drain both pipes on background threads *while the process runs*.
+        // A pipe's kernel buffer is ~64KB; some commands (e.g. `mail save`
+        // dumping a multi-megabyte message source) write far more than that
+        // to stdout. Reading via readDataToEndOfFile() only after
+        // waitUntilExit() deadlocks as soon as osascript fills that buffer
+        // and blocks on write() with nothing draining the other end.
+        var outData = Data()
+        var errData = Data()
+        let readGroup = DispatchGroup()
+        let outHandle = stdoutPipe.fileHandleForReading
+        let errHandle = stderrPipe.fileHandleForReading
+
         do {
             try process.run()
         } catch {
             throw CLIError("Failed to launch osascript: \(error.localizedDescription)")
         }
+
+        readGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            outData = outHandle.readDataToEndOfFile()
+            readGroup.leave()
+        }
+        readGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            errData = errHandle.readDataToEndOfFile()
+            readGroup.leave()
+        }
+
         process.waitUntilExit()
-        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        readGroup.wait()
+
         if process.terminationStatus != 0 {
             let msg = String(data: errData, encoding: .utf8) ?? "unknown osascript error"
             throw CLIError("AppleScript failed: \(msg.trimmingCharacters(in: .whitespacesAndNewlines))")
