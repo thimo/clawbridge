@@ -11,6 +11,7 @@ struct Clawbridge: AsyncParsableCommand {
             RemindersCommand.self,
             MailCommand.self,
             PermissionsCommand.self,
+            RunCommand.self,
         ]
     )
 }
