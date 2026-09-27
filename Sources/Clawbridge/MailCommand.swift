@@ -16,6 +16,7 @@ struct MailCommand: AsyncParsableCommand {
             MailSearchCommand.self,
             MailFoldersCommand.self,
             MailTrashCommand.self,
+            MailMoveCommand.self,
             MailSendCommand.self,
             MailSaveCommand.self,
         ]
@@ -197,13 +198,58 @@ struct MailTrashCommand: AsyncParsableCommand {
             guard !messageId.isEmpty else {
                 throw CLIError("At least one --message-id is required.")
             }
-            let moved = try MailScript.trash(
+            let result = try MailScript.trash(
                 messageIds: messageId, accounts: account, mailbox: mailbox
             )
             let payload: [String: Any] = [
                 "ok": true,
                 "requested": messageId.count,
-                "moved": moved,
+                "moved": result.moved,
+                "missing": result.missing,
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try MailJSON.write(data, toFile: output)
+        } catch {
+            try MailJSON.emitError(error, toFile: output)
+            throw ExitCode.failure
+        }
+    }
+}
+
+struct MailMoveCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "move",
+        abstract: "Move messages (matched by message id) to another mailbox in the same account."
+    )
+
+    @Option(name: [.customLong("message-id"), .customShort("i")], help: "Message id to move (repeatable).")
+    var messageId: [String]
+
+    @Option(name: [.customShort("a"), .long], help: "Limit to a specific account name (repeatable).")
+    var account: [String] = []
+
+    @Option(name: [.customShort("m"), .long], help: "Source mailbox/folder name (default: inbox).")
+    var mailbox: String?
+
+    @Option(name: .long, help: "Destination mailbox, in the source's account. Never created.")
+    var to: String
+
+    @Option(name: [.customShort("o"), .long], help: "Write status JSON to this file instead of stdout.")
+    var output: String?
+
+    func run() async throws {
+        do {
+            guard !messageId.isEmpty else {
+                throw CLIError("At least one --message-id is required.")
+            }
+            let result = try MailScript.move(
+                messageIds: messageId, accounts: account, mailbox: mailbox, target: to
+            )
+            let payload: [String: Any] = [
+                "ok": true,
+                "requested": messageId.count,
+                "moved": result.moved,
+                "missing": result.missing,
             ]
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
             try MailJSON.write(data, toFile: output)
@@ -346,12 +392,35 @@ struct MailSaveCommand: AsyncParsableCommand {
 // MARK: - AppleScript bridge
 
 enum MailScript {
-    /// Per-account AppleScript expression yielding the message source for loop var `acc`.
-    /// `inbox of acc` when no mailbox name given, else `mailbox "<name>" of acc`.
-    private static func mailboxExpr(_ mailbox: String?) -> String {
-        guard let mb = mailbox else { return "inbox of acc" }
-        let esc = mb.replacingOccurrences(of: "\"", with: "\\\"")
-        return "mailbox \"\(esc)\" of acc"
+    private static func asLiteral(_ s: String) -> String {
+        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
+    /// AppleScript that fills `boxes` with the mailbox on every selected
+    /// account that actually has it. Only the lookup may fail per account (a
+    /// mailbox name tried on every account won't exist on most); if none has
+    /// it, the script errors instead of quietly yielding an empty result.
+    private static func resolveBoxes(_ accounts: [String], _ mailbox: String?) -> String {
+        let accountFilter = makeAccountFilter(accounts)
+        let label = asLiteral(mailbox ?? "inbox")
+        // No per-account `inbox` in Mail's dictionary: IMAP calls it "INBOX",
+        // Exchange "Inbox".
+        let names = (mailbox.map { [$0] } ?? ["INBOX", "Inbox"]).map(asLiteral).joined(separator: ", ")
+        return """
+            set boxes to {}
+            \(accountFilter.scriptHeader)
+            repeat with acc in \(accountFilter.scriptIterable)
+                repeat with nm in {\(names)}
+                    try
+                        set mbRef to mailbox (nm as text) of acc
+                        get name of mbRef
+                        set end of boxes to mbRef
+                        exit repeat
+                    end try
+                end repeat
+            end repeat
+            if (count of boxes) is 0 then error "mailbox not found: " & \(label)
+        """
     }
 
     static func fetchMessages(
@@ -361,28 +430,59 @@ enum MailScript {
         mailbox: String?,
         sinceDate: Date?
     ) throws -> [MailMessage] {
-        let unreadFilter = unreadOnly ? "and read status is false" : ""
-        let accountFilter = makeAccountFilter(accounts)
-        let sinceFilter = makeSinceFilter(sinceDate)
-        let filterClause = [unreadFilter, sinceFilter].filter { !$0.isEmpty }.joined(separator: " ")
-        let src = mailboxExpr(mailbox)
+        if let hits = try MailIndex.list(
+            accounts: accounts, mailbox: mailbox, limit: limit, unreadOnly: unreadOnly, since: sinceDate
+        ) {
+            return hits
+        }
+        var conditions: [String] = []
+        if unreadOnly { conditions.append("read status is false") }
+        if let since = sinceDate {
+            // Relative to `current date`: a date literal would be parsed in
+            // the user's locale.
+            let secs = max(0, Int(Date().timeIntervalSince(since)))
+            conditions.append("date received > ((current date) - \(secs))")
+        }
+        // Without a filter, skip `whose` (it makes Mail walk the whole mailbox)
+        // and take the first `limit` messages; Mail keeps them newest-first.
+        let collect: String
+        if conditions.isEmpty {
+            collect = """
+                    set c to count of messages of mb
+                    if c > \(limit) then set c to \(limit)
+                    if c > 0 then set msgList to msgList & (messages 1 thru c of mb)
+            """
+        } else {
+            collect = "        set msgList to msgList & (messages of mb whose \(conditions.joined(separator: " and ")))"
+        }
+        return try listMessages(accounts: accounts, mailbox: mailbox, limit: limit, collect: collect)
+    }
 
+    static func search(query: String, limit: Int, accounts: [String], mailbox: String?) throws -> [MailMessage] {
+        if let hits = try MailIndex.list(accounts: accounts, mailbox: mailbox, limit: limit, query: query) {
+            return hits
+        }
+        let q = asLiteral(query)
+        let collect = "        set msgList to msgList & (messages of mb whose (subject contains \(q) or sender contains \(q)))"
+        return try listMessages(accounts: accounts, mailbox: mailbox, limit: limit, collect: collect)
+    }
+
+    /// `collect` appends message references from mailbox `mb` to `msgList`.
+    private static func listMessages(
+        accounts: [String], mailbox: String?, limit: Int, collect: String
+    ) throws -> [MailMessage] {
         let script = """
         tell application "Mail"
+        \(resolveBoxes(accounts, mailbox))
             set out to ""
             set msgList to {}
-            \(accountFilter.scriptHeader)
-            repeat with acc in \(accountFilter.scriptIterable)
-                try
-                    set boxMsgs to (messages of (\(src)) whose 1 = 1 \(filterClause))
-                    set msgList to msgList & boxMsgs
-                end try
+            repeat with mbItem in boxes
+                set mb to contents of mbItem
+        \(collect)
             end repeat
-            -- Sort by date received descending; AppleScript can't sort, so we iterate.
             set total to count of msgList
             set cap to \(limit)
             if total < cap then set cap to total
-            -- Mail returns mailbox messages roughly newest-first; trust that order.
             repeat with i from 1 to cap
                 set m to item i of msgList
                 try
@@ -419,99 +519,46 @@ enum MailScript {
             return out
         end tell
 
-        on isoFromDate(d)
-            set y to year of d as integer
-            set mo to (month of d as integer)
-            set dy to day of d
-            set h to hours of d
-            set mi to minutes of d
-            set s to seconds of d
-            set ystr to text -4 thru -1 of ("0000" & y)
-            set mostr to text -2 thru -1 of ("00" & mo)
-            set dystr to text -2 thru -1 of ("00" & dy)
-            set hstr to text -2 thru -1 of ("00" & h)
-            set mistr to text -2 thru -1 of ("00" & mi)
-            set sstr to text -2 thru -1 of ("00" & s)
-            return ystr & "-" & mostr & "-" & dystr & "T" & hstr & ":" & mistr & ":" & sstr
-        end isoFromDate
+        \(isoHandler)
         """
-
         let raw = try runOsascript(script)
         return parseMessageList(raw)
     }
 
-    static func search(query: String, limit: Int, accounts: [String], mailbox: String?) throws -> [MailMessage] {
-        let q = query.replacingOccurrences(of: "\"", with: "\\\"")
-        let accountFilter = makeAccountFilter(accounts)
-        let src = mailboxExpr(mailbox)
+    private static let isoHandler = """
+    on isoFromDate(d)
+        set y to year of d as integer
+        set mo to (month of d as integer)
+        set dy to day of d
+        set h to hours of d
+        set mi to minutes of d
+        set s to seconds of d
+        set ystr to text -4 thru -1 of ("0000" & y)
+        set mostr to text -2 thru -1 of ("00" & mo)
+        set dystr to text -2 thru -1 of ("00" & dy)
+        set hstr to text -2 thru -1 of ("00" & h)
+        set mistr to text -2 thru -1 of ("00" & mi)
+        set sstr to text -2 thru -1 of ("00" & s)
+        return ystr & "-" & mostr & "-" & dystr & "T" & hstr & ":" & mistr & ":" & sstr
+    end isoFromDate
+    """
+
+    /// Name and id (the UUID in Mail's index URLs) of every account.
+    static func accountIds() throws -> [(name: String, id: String)] {
         let script = """
         tell application "Mail"
             set out to ""
-            set msgList to {}
-            \(accountFilter.scriptHeader)
-            repeat with acc in \(accountFilter.scriptIterable)
-                try
-                    set hits to (messages of (\(src)) whose (subject contains "\(q)" or sender contains "\(q)"))
-                    set msgList to msgList & hits
-                end try
-            end repeat
-            set total to count of msgList
-            set cap to \(limit)
-            if total < cap then set cap to total
-            repeat with i from 1 to cap
-                set m to item i of msgList
-                try
-                    set sub to subject of m
-                on error
-                    set sub to ""
-                end try
-                try
-                    set snd to sender of m
-                on error
-                    set snd to ""
-                end try
-                try
-                    set rcv to date received of m
-                on error
-                    set rcv to missing value
-                end try
-                try
-                    set isUnread to read status of m is false
-                on error
-                    set isUnread to false
-                end try
-                try
-                    set msgId to message id of m
-                on error
-                    set msgId to ""
-                end try
-                set rcvIso to ""
-                if rcv is not missing value then
-                    set rcvIso to my isoFromDate(rcv)
-                end if
-                set out to out & sub & "\\t" & snd & "\\t" & rcvIso & "\\t" & (isUnread as text) & "\\t" & msgId & "\\n"
+            repeat with acc in every account
+                set out to out & (name of acc) & tab & (id of acc) & linefeed
             end repeat
             return out
         end tell
-
-        on isoFromDate(d)
-            set y to year of d as integer
-            set mo to (month of d as integer)
-            set dy to day of d
-            set h to hours of d
-            set mi to minutes of d
-            set s to seconds of d
-            set ystr to text -4 thru -1 of ("0000" & y)
-            set mostr to text -2 thru -1 of ("00" & mo)
-            set dystr to text -2 thru -1 of ("00" & dy)
-            set hstr to text -2 thru -1 of ("00" & h)
-            set mistr to text -2 thru -1 of ("00" & mi)
-            set sstr to text -2 thru -1 of ("00" & s)
-            return ystr & "-" & mostr & "-" & dystr & "T" & hstr & ":" & mistr & ":" & sstr
-        end isoFromDate
         """
-        let raw = try runOsascript(script)
-        return parseMessageList(raw)
+        return try runOsascript(script).split(separator: "\n").compactMap { line in
+            let parts = line.components(separatedBy: "\t")
+            guard parts.count == 2 else { return nil }
+            return (name: parts[0], id: parts[1])
+        }
     }
 
     static func listFolders(accounts: [String]) throws -> [(account: String, mailbox: String)] {
@@ -541,69 +588,157 @@ enum MailScript {
         }
     }
 
-    static func trash(messageIds: [String], accounts: [String], mailbox: String?) throws -> Int {
-        let accountFilter = makeAccountFilter(accounts)
-        let src = mailboxExpr(mailbox)
-        let idLiterals = messageIds
-            .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-            .joined(separator: ", ")
+    static func trash(messageIds: [String], accounts: [String], mailbox: String?) throws -> (moved: Int, missing: [String]) {
+        // Mark read before trashing: a message moved to Trash while still
+        // unread keeps inflating unread counts / re-surfacing in some clients.
+        let action = """
+                        try
+                            set read status of m to true
+                        end try
+                        delete m
+        """
+        return try actWithRetry(messageIds: messageIds, accounts: accounts, mailbox: mailbox, prelude: "", action: action)
+    }
+
+    /// Move messages to mailbox `target` in the same account as the source
+    /// box. Errors before touching anything if an account lacks `target`.
+    static func move(
+        messageIds: [String], accounts: [String], mailbox: String?, target: String
+    ) throws -> (moved: Int, missing: [String]) {
+        let t = asLiteral(target)
+        let prelude = """
+            set targets to {}
+            repeat with mbItem in boxes
+                set acc to account of (contents of mbItem)
+                try
+                    set tgt to mailbox \(t) of acc
+                    get name of tgt
+                on error
+                    error "target mailbox not found: " & \(t) & " in account " & (name of acc)
+                end try
+                set end of targets to tgt
+            end repeat
+        """
+        let action = "                move m to (item k of targets)"
+        return try actWithRetry(messageIds: messageIds, accounts: accounts, mailbox: mailbox, prelude: prelude, action: action)
+    }
+
+    /// Run `action` once, then retry ids that matched nothing once more:
+    /// Mail's index occasionally lags a message that is plainly there, so the
+    /// retry also scans the mailbox for ids the index still doesn't have.
+    private static func actWithRetry(
+        messageIds: [String], accounts: [String], mailbox: String?, prelude: String, action: String
+    ) throws -> (moved: Int, missing: [String]) {
+        var counts = try act(messageIds: messageIds, accounts: accounts, mailbox: mailbox, prelude: prelude, action: action)
+        var missing = messageIds.filter { (counts[$0] ?? 0) == 0 }
+        if !missing.isEmpty {
+            Thread.sleep(forTimeInterval: 2)
+            let retry = try act(
+                messageIds: missing, accounts: accounts, mailbox: mailbox, prelude: prelude, action: action,
+                scanIfUnindexed: true
+            )
+            counts.merge(retry) { $0 + $1 }
+            missing = missing.filter { (retry[$0] ?? 0) == 0 }
+        }
+        return (moved: counts.values.reduce(0, +), missing: missing)
+    }
+
+    /// Apply `action` (AppleScript on message `m`, found in `item k of boxes`)
+    /// to every message matching each id. Returns the match count per id.
+    private static func act(
+        messageIds: [String], accounts: [String], mailbox: String?, prelude: String, action: String,
+        scanIfUnindexed: Bool = false
+    ) throws -> [String: Int] {
         let script = """
         tell application "Mail"
-            set n to 0
-            set wanted to {\(idLiterals)}
-            \(accountFilter.scriptHeader)
-            repeat with acc in \(accountFilter.scriptIterable)
-                try
-                    set mb to (\(src))
-                    repeat with wid in wanted
+        \(resolveBoxes(accounts, mailbox))
+        \(prelude)
+            set wanted to \(wantedList(messageIds, accounts: accounts, mailbox: mailbox, scanIfUnindexed: scanIfUnindexed))
+            set out to ""
+            repeat with w in wanted
+                set n to 0
+                repeat with k from 1 to count of boxes
+                    set hits to my findMsgs(item k of boxes, item 1 of w, item 2 of w)
+                    repeat with m in hits
                         try
-                            set hits to (messages of mb whose message id is (wid as text))
-                            repeat with m in hits
-                                -- Mark read before trashing: a message moved
-                                -- to Trash while still unread keeps inflating
-                                -- unread counts / re-surfacing in some clients.
-                                try
-                                    set read status of m to true
-                                end try
-                                delete m
-                                set n to n + 1
-                            end repeat
+        \(action)
+                            set n to n + 1
                         end try
                     end repeat
+                end repeat
+                set out to out & n & linefeed
+            end repeat
+            return out
+        end tell
+
+        \(findHandler)
+        """
+        let lines = try runOsascript(script).split(separator: "\n").map {
+            Int($0.trimmingCharacters(in: .whitespaces)) ?? 0
+        }
+        guard lines.count == messageIds.count else {
+            throw CLIError("unexpected AppleScript output: \(lines.count) counts for \(messageIds.count) ids")
+        }
+        var counts: [String: Int] = [:]
+        for (id, n) in zip(messageIds, lines) { counts[id, default: 0] += n }
+        return counts
+    }
+
+    /// AppleScript list `{{"<message-id>", <internal ids>}, …}`. The internal
+    /// ids come from Mail's index; `missing value` when the index can't be
+    /// read (or, with `scanIfUnindexed`, doesn't know the id), which makes
+    /// `findMsgs` fall back to `whose`.
+    private static func wantedList(
+        _ messageIds: [String], accounts: [String], mailbox: String?, scanIfUnindexed: Bool = false
+    ) -> String {
+        let rowids = MailIndex.rowids(messageIds: messageIds, accounts: accounts, mailbox: mailbox)
+        let items = messageIds.map { id -> String in
+            guard let hits = rowids?[id], !(hits.isEmpty && scanIfUnindexed) else {
+                return "{\(asLiteral(id)), missing value}"
+            }
+            return "{\(asLiteral(id)), {\(hits.map(String.init).joined(separator: ", "))}}"
+        }
+        return "{" + items.joined(separator: ", ") + "}"
+    }
+
+    /// `findMsgs(mb, wid, rowids)`: the messages in `mb` with Message-ID `wid`.
+    /// Addressing by internal id is instant; `whose` walks the whole mailbox
+    /// (~30 s on a 27k-message Archive), so it is only the fallback.
+    private static let findHandler = """
+    on findMsgs(mb, wid, rowids)
+        tell application "Mail"
+            if rowids is missing value then
+                return (messages of mb whose message id is (wid as text))
+            end if
+            set hits to {}
+            repeat with r in rowids
+                try
+                    set m to «class mssg» id (r as integer) of mb
+                    get id of m
+                    set end of hits to m
                 end try
             end repeat
-            return (n as text)
+            return hits
         end tell
-        """
-        let raw = try runOsascript(script).trimmingCharacters(in: .whitespacesAndNewlines)
-        return Int(raw) ?? 0
-    }
+    end findMsgs
+    """
 
     /// Fetch one message's subject/sender/received-date/raw-source by exact RFC
     /// Message-ID. Throws if zero or more than one message matches.
     static func save(
         messageId: String, accounts: [String], mailbox: String?
     ) throws -> (subject: String, sender: String, receivedISO: String?, source: String) {
-        let escId = messageId.replacingOccurrences(of: "\"", with: "\\\"")
-        let accountFilter = makeAccountFilter(accounts)
-        let src = mailboxExpr(mailbox)
         // Generated fresh per call: a boundary the message source itself can't
         // fake, so metadata and raw source can be split back apart in Swift
         // without assuming anything about what's inside the source.
         let separator = UUID().uuidString
         let script = """
         tell application "Mail"
-            set wanted to "\(escId)"
+        \(resolveBoxes(accounts, mailbox))
+            set w to item 1 of \(wantedList([messageId], accounts: accounts, mailbox: mailbox, scanIfUnindexed: true))
             set hits to {}
-            \(accountFilter.scriptHeader)
-            repeat with acc in \(accountFilter.scriptIterable)
-                try
-                    set mb to (\(src))
-                    try
-                        set found to (messages of mb whose message id is wanted)
-                        set hits to hits & found
-                    end try
-                end try
+            repeat with mbItem in boxes
+                set hits to hits & my findMsgs(contents of mbItem, item 1 of w, item 2 of w)
             end repeat
             set n to count of hits
             if n is not 1 then
@@ -629,21 +764,9 @@ enum MailScript {
             return "1" & linefeed & sub & "\\t" & snd & "\\t" & rcvIso & linefeed & "\(separator)" & linefeed & srcText
         end tell
 
-        on isoFromDate(d)
-            set y to year of d as integer
-            set mo to (month of d as integer)
-            set dy to day of d
-            set h to hours of d
-            set mi to minutes of d
-            set s to seconds of d
-            set ystr to text -4 thru -1 of ("0000" & y)
-            set mostr to text -2 thru -1 of ("00" & mo)
-            set dystr to text -2 thru -1 of ("00" & dy)
-            set hstr to text -2 thru -1 of ("00" & h)
-            set mistr to text -2 thru -1 of ("00" & mi)
-            set sstr to text -2 thru -1 of ("00" & s)
-            return ystr & "-" & mostr & "-" & dystr & "T" & hstr & ":" & mistr & ":" & sstr
-        end isoFromDate
+        \(findHandler)
+
+        \(isoHandler)
         """
 
         var raw = try runOsascript(script)
@@ -739,17 +862,6 @@ enum MailScript {
             scriptHeader: "set acctNames to {\(escaped)}\n            set acctList to {}\n            repeat with an in acctNames\n                try\n                    set acctList to acctList & {account named (an as text)}\n                end try\n            end repeat",
             scriptIterable: "acctList"
         )
-    }
-
-    private static func makeSinceFilter(_ sinceDate: Date?) -> String {
-        guard let d = sinceDate else { return "" }
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        fmt.timeZone = TimeZone.current
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        let s = fmt.string(from: d)
-        // AppleScript date literal: `date "yyyy-MM-dd HH:mm:ss"` — Mail will coerce.
-        return "and date received > (date \"\(s)\")"
     }
 
     private static func parseMessageList(_ raw: String) -> [MailMessage] {
