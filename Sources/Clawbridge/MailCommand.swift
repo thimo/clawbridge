@@ -378,6 +378,7 @@ struct MailSaveCommand: AsyncParsableCommand {
                 "subject": result.subject,
                 "sender": result.sender,
                 "bytes": data.count,
+                "copies": result.copies,
             ]
             if let r = result.receivedISO { payload["received"] = r }
             let jsonData = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
@@ -724,10 +725,12 @@ enum MailScript {
     """
 
     /// Fetch one message's subject/sender/received-date/raw-source by exact RFC
-    /// Message-ID. Throws if zero or more than one message matches.
+    /// Message-ID. Throws if nothing matches. Several matches are copies of the
+    /// same message (a sender's redelivery, or the same mail in two mailboxes),
+    /// so the first one is returned and `copies` says how many there were.
     static func save(
         messageId: String, accounts: [String], mailbox: String?
-    ) throws -> (subject: String, sender: String, receivedISO: String?, source: String) {
+    ) throws -> (subject: String, sender: String, receivedISO: String?, source: String, copies: Int) {
         // Generated fresh per call: a boundary the message source itself can't
         // fake, so metadata and raw source can be split back apart in Swift
         // without assuming anything about what's inside the source.
@@ -741,8 +744,8 @@ enum MailScript {
                 set hits to hits & my findMsgs(contents of mbItem, item 1 of w, item 2 of w)
             end repeat
             set n to count of hits
-            if n is not 1 then
-                return (n as text)
+            if n is 0 then
+                return "0"
             end if
             set m to item 1 of hits
             try
@@ -761,7 +764,7 @@ enum MailScript {
                 set rcvIso to my isoFromDate(rcv)
             end try
             set srcText to source of m
-            return "1" & linefeed & sub & "\\t" & snd & "\\t" & rcvIso & linefeed & "\(separator)" & linefeed & srcText
+            return (n as text) & linefeed & sub & "\\t" & snd & "\\t" & rcvIso & linefeed & "\(separator)" & linefeed & srcText
         end tell
 
         \(findHandler)
@@ -783,13 +786,13 @@ enum MailScript {
             if count == 0 {
                 throw CLIError("message not found: \(messageId)")
             }
-            throw CLIError("ambiguous: \(count) messages match \(messageId)")
+            throw CLIError("unexpected AppleScript output while saving message \(messageId)")
         }
 
         let metadataBlock = String(raw[raw.startIndex..<sepRange.lowerBound])
         let sourceText = String(raw[sepRange.upperBound...])
         let metaLines = metadataBlock.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-        guard metaLines.count == 2 else {
+        guard metaLines.count == 2, let copies = Int(metaLines[0]) else {
             throw CLIError("unexpected AppleScript output while saving message \(messageId)")
         }
         let fields = metaLines[1].components(separatedBy: "\t")
@@ -797,7 +800,7 @@ enum MailScript {
         let sender = fields.count > 1 ? fields[1] : ""
         let receivedISO = (fields.count > 2 && !fields[2].isEmpty) ? fields[2] : nil
 
-        return (subject: subject, sender: sender, receivedISO: receivedISO, source: sourceText)
+        return (subject: subject, sender: sender, receivedISO: receivedISO, source: sourceText, copies: copies)
     }
 
     static func send(
