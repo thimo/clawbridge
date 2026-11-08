@@ -17,6 +17,7 @@ struct MailCommand: AsyncParsableCommand {
             MailFoldersCommand.self,
             MailTrashCommand.self,
             MailMoveCommand.self,
+            MailMarkReadCommand.self,
             MailSendCommand.self,
             MailSaveCommand.self,
         ]
@@ -249,6 +250,45 @@ struct MailMoveCommand: AsyncParsableCommand {
                 "ok": true,
                 "requested": messageId.count,
                 "moved": result.moved,
+                "missing": result.missing,
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try MailJSON.write(data, toFile: output)
+        } catch {
+            try MailJSON.emitError(error, toFile: output)
+            throw ExitCode.failure
+        }
+    }
+}
+
+struct MailMarkReadCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "mark-read",
+        abstract: "Mark messages (matched by message id) as read, leaving them where they are."
+    )
+
+    @Option(name: [.customLong("message-id"), .customShort("i")], help: "Message id to mark read (repeatable).")
+    var messageId: [String]
+
+    @Option(name: [.customShort("a"), .long], help: "Limit to a specific account name (repeatable).")
+    var account: [String] = []
+
+    @Option(name: [.customShort("m"), .long], help: "Mailbox/folder name to search in (default: inbox).")
+    var mailbox: String?
+
+    @Option(name: [.customShort("o"), .long], help: "Write status JSON to this file instead of stdout.")
+    var output: String?
+
+    func run() async throws {
+        do {
+            guard !messageId.isEmpty else {
+                throw CLIError("At least one --message-id is required.")
+            }
+            let result = try MailScript.markRead(messageIds: messageId, accounts: account, mailbox: mailbox)
+            let payload: [String: Any] = [
+                "ok": true,
+                "requested": messageId.count,
+                "marked": result.moved,
                 "missing": result.missing,
             ]
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
@@ -598,6 +638,11 @@ enum MailScript {
                         end try
                         delete m
         """
+        return try actWithRetry(messageIds: messageIds, accounts: accounts, mailbox: mailbox, prelude: "", action: action)
+    }
+
+    static func markRead(messageIds: [String], accounts: [String], mailbox: String?) throws -> (moved: Int, missing: [String]) {
+        let action = "                set read status of m to true"
         return try actWithRetry(messageIds: messageIds, accounts: accounts, mailbox: mailbox, prelude: "", action: action)
     }
 
