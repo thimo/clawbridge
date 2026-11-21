@@ -14,6 +14,7 @@ struct RemindersCommand: AsyncParsableCommand {
             RemindersPendingCommand.self,
             RemindersAllCommand.self,
             RemindersAddCommand.self,
+            RemindersDeleteCommand.self,
         ]
     )
 }
@@ -214,6 +215,50 @@ struct RemindersAddCommand: AsyncParsableCommand {
             }
 
             try ReminderJSON.emit([reminder], toFile: output)
+        } catch {
+            try ReminderJSON.emitError(error, toFile: output)
+            throw ExitCode.failure
+        }
+    }
+}
+
+struct RemindersDeleteCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "delete",
+        abstract: "Delete reminders by id (as returned in the `id` field). Prints the deleted reminders as JSON."
+    )
+
+    @Option(name: [.customShort("i"), .long], help: "Reminder id (repeatable). Only exact ids, never by name or list.")
+    var id: [String] = []
+
+    @Option(name: [.customShort("o"), .long], help: "Write JSON to this file instead of stdout.")
+    var output: String?
+
+    func run() async throws {
+        do {
+            guard !id.isEmpty else { throw CLIError("Pass at least one --id.") }
+            let store = try await RemindersAccess.requestAccess()
+
+            // Resolve every id first, so an unknown id deletes nothing.
+            var targets: [EKReminder] = []
+            for rid in id {
+                guard let reminder = store.calendarItem(withIdentifier: rid) as? EKReminder else {
+                    throw CLIError("No reminder with id '\(rid)'. Nothing deleted.")
+                }
+                targets.append(reminder)
+            }
+
+            do {
+                for reminder in targets {
+                    try store.remove(reminder, commit: false)
+                }
+                try store.commit()
+            } catch {
+                store.reset()
+                throw CLIError("Failed to delete reminders: \(error.localizedDescription)")
+            }
+
+            try ReminderJSON.emit(targets, toFile: output)
         } catch {
             try ReminderJSON.emitError(error, toFile: output)
             throw ExitCode.failure
